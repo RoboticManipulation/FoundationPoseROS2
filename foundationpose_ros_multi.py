@@ -124,9 +124,13 @@ class PoseEstimationNode(Node):
         super().__init__('pose_estimation_node')
         
         # ROS subscriptions and publishers
-        self.image_sub = self.create_subscription(Image, '/camera/camera/color/image_raw', self.image_callback, 10)
-        self.depth_sub = self.create_subscription(Image, '/camera/camera/aligned_depth_to_color/image_raw', self.depth_callback, 10)
-        self.info_sub = self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.camera_info_callback, 10)
+        # self.image_sub = self.create_subscription(Image, '/camera/camera/color/image_raw', self.image_callback, 10)
+        # self.depth_sub = self.create_subscription(Image, '/camera/camera/aligned_depth_to_color/image_raw', self.depth_callback, 10)
+        # self.info_sub = self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.camera_info_callback, 10)
+        
+        self.image_sub = self.create_subscription(Image, '/sim_camera_rgb', self.image_callback, 10)
+        self.depth_sub = self.create_subscription(Image, '/sim_camera_depth', self.depth_callback, 10)
+        self.info_sub = self.create_subscription(CameraInfo, '/sim_camera_info', self.camera_info_callback, 10)
         
         self.bridge = CvBridge()
         self.depth_image = None
@@ -158,11 +162,62 @@ class PoseEstimationNode(Node):
             self.get_logger().info(f"Camera intrinsic matrix initialized: {self.cam_K}")
 
     def image_callback(self, msg):
-        self.color_image = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        try:
+            # Convert to OpenCV format using the message's native encoding first
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+
+            # Convert to RGB if needed
+            if msg.encoding == "bgr8":
+                self.color_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+            elif msg.encoding == "rgb8":
+                self.color_image = cv_image
+            elif msg.encoding == "mono8" or msg.encoding == "8UC1":
+                self.color_image = cv2.cvtColor(cv_image, cv2.COLOR_GRAY2RGB)
+            else:
+                self.get_logger().warn(f"Unexpected color image encoding: {msg.encoding}. Attempting conversion.")
+                self.color_image = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert color image: {e}, encoding: {msg.encoding}")
+            return
 
     def depth_callback(self, msg):
-        self.depth_image = self.bridge.imgmsg_to_cv2(msg, "32FC1") / 1e3
-        self.process_images()
+        try:
+            # Check if message has data
+            if not msg.data or msg.height == 0 or msg.width == 0:
+                self.get_logger().warn("Received empty depth image message")
+                return
+
+            # For depth images, try to convert based on encoding
+            if msg.encoding == "32FC1":
+                # Directly convert 32FC1 to float32
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
+            elif msg.encoding == "16UC1":
+                # Convert 16-bit depth to float32 in meters
+                depth_uint16 = self.bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
+                self.depth_image = depth_uint16.astype(np.float32) / 1000.0
+            else:
+                # Try passthrough for other encodings
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+
+                # Ensure depth is in meters (float32)
+                if self.depth_image.dtype == np.uint16:
+                    self.depth_image = self.depth_image.astype(np.float32) / 1000.0
+                elif self.depth_image.dtype == np.float32:
+                    # Check if it's in millimeters
+                    if self.depth_image.max() > 100:  # Likely in mm if max > 100
+                        self.depth_image = self.depth_image / 1000.0
+
+            # Verify we got a valid image
+            if self.depth_image is None or self.depth_image.size == 0:
+                self.get_logger().warn("Depth image conversion resulted in empty array")
+                return
+
+            self.process_images()
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert depth image: {e}, encoding: {msg.encoding}, height: {msg.height}, width: {msg.width}")
+            import traceback
+            self.get_logger().error(f"Traceback: {traceback.format_exc()}")
+            return
 
     def process_images(self):
         if self.color_image is None or self.depth_image is None or self.cam_K is None:
